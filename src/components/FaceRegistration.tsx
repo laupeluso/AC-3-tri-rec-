@@ -9,6 +9,7 @@ import {
   Sparkles,
   ChevronRight,
   UserCheck,
+  Database,
 } from 'lucide-react';
 import { CameraView } from './CameraView';
 import { faceService } from '../services/faceRecognitionService';
@@ -80,6 +81,8 @@ export const FaceRegistration: React.FC<FaceRegistrationProps> = ({
 }) => {
   const [currentStep, setCurrentStep] = useState<RegStep>('idle');
   const [ownerName, setOwnerName] = useState<string>(existingProfile?.name || 'Administrador do Sistema');
+  const [email, setEmail] = useState<string>('aluno@escola.com');
+  const [password, setPassword] = useState<string>('123456');
   const [showOverwriteWarning, setShowOverwriteWarning] = useState<boolean>(false);
   const [hasConfirmedOverwrite, setHasConfirmedOverwrite] = useState<boolean>(false);
 
@@ -108,16 +111,28 @@ export const FaceRegistration: React.FC<FaceRegistrationProps> = ({
   const [isProcessingSample, setIsProcessingSample] = useState<boolean>(false);
   const [statusMessage, setStatusMessage] = useState<string>('Aguardando início do cadastramento...');
   const [authStatus, setAuthStatus] = useState<AuthStatusCode>('idle');
+  const [dbHealth, setDbHealth] = useState<{
+    configured: boolean;
+    connected: boolean;
+    tableReady: boolean;
+    message: string;
+    details?: string;
+  } | null>(null);
 
   // Controle de estabilidade de quadro antes de disparar captura
   const stableHoldCountRef = useRef<number>(0);
   const isCapturingRef = useRef<boolean>(false);
 
-  // Inicializar serviços
+  // Inicializar serviços e verificar saúde do Supabase
   useEffect(() => {
     faceService.initialize().catch((err) => {
       console.error('Falha ao inicializar modelos:', err);
       setStatusMessage('Erro ao carregar modelos biométricos.');
+    });
+
+    faceService.checkSupabaseHealth().then((health) => {
+      setDbHealth(health);
+      console.log('[FaceID Supabase] Diagnóstico do banco:', health);
     });
   }, []);
 
@@ -191,14 +206,26 @@ export const FaceRegistration: React.FC<FaceRegistrationProps> = ({
           setStatusMessage('Retorne à posição frontal e dê uma piscada para validar vivacidade.');
           setAuthStatus('positioning');
         } else if (stepId === 'blink') {
-          // Todas as amostras capturadas! Finalizar perfil
+          // Todas as amostras capturadas! Finalizar perfil no Supabase
           console.log('[FaceID Enrollment] Gravando perfil biométrico final com', currentList.length, 'amostras');
-          const newProfile = faceService.saveProfile(ownerName, currentList);
-          audioFeedback.playSuccessUnlock();
-          setCurrentStep('success');
-          setAuthStatus('authorized');
-          setStatusMessage('Rosto cadastrado com sucesso!');
-          onRegistrationSuccess(newProfile);
+          setStatusMessage('Gravando biometria no banco de dados Supabase...');
+          try {
+            const newProfile = await faceService.saveProfile(ownerName, currentList, { email, password });
+            audioFeedback.playSuccessUnlock();
+            setCurrentStep('success');
+            setAuthStatus('authorized');
+            setStatusMessage('Rosto cadastrado com sucesso no Supabase!');
+            onRegistrationSuccess(newProfile);
+          } catch (dbErr: any) {
+            console.error('[FaceID Supabase] Erro ao salvar no banco:', dbErr);
+            // Salvar localmente para garantir que o usuário não perca seu fluxo
+            const fallbackProfile = faceService.saveProfileLocally(ownerName, currentList);
+            audioFeedback.playSuccessUnlock();
+            setCurrentStep('success');
+            setAuthStatus('authorized');
+            setStatusMessage(`Rosto salvo localmente. Nota do banco: ${dbErr?.message || 'Falha de conexão'}`);
+            onRegistrationSuccess(fallbackProfile);
+          }
         }
       } else {
         setStatusMessage('Não foi possível extrair os traços com nitidez. Mantenha-se firme...');
@@ -210,7 +237,7 @@ export const FaceRegistration: React.FC<FaceRegistrationProps> = ({
       isCapturingRef.current = false;
       setIsProcessingSample(false);
     }
-  }, [ownerName, onRegistrationSuccess, quality.score]);
+  }, [ownerName, email, password, onRegistrationSuccess, quality.score]);
 
   // Processamento de cada quadro de vídeo
   const handleVideoFrame = useCallback(
@@ -414,9 +441,84 @@ export const FaceRegistration: React.FC<FaceRegistrationProps> = ({
                 disabled={currentStep !== 'idle'}
                 className="cyber-input"
               />
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginTop: '8px' }}>
+                <div>
+                  <label htmlFor="owner-email" style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                    E-mail do Usuário:
+                  </label>
+                  <input
+                    id="owner-email"
+                    type="email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder="aluno@escola.com"
+                    disabled={currentStep !== 'idle'}
+                    className="cyber-input"
+                    style={{ fontSize: '12px', padding: '6px 10px' }}
+                  />
+                </div>
+                <div>
+                  <label htmlFor="owner-password" style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                    Senha de Acesso:
+                  </label>
+                  <input
+                    id="owner-password"
+                    type="password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="123456"
+                    disabled={currentStep !== 'idle'}
+                    className="cyber-input"
+                    style={{ fontSize: '12px', padding: '6px 10px' }}
+                  />
+                </div>
+              </div>
+
               <span className="input-helper">
-                Este cadastro será configurado como a única chave biométrica autorizada.
+                Vincula o cadastro biométrico à conta em auth.users para garantir a integridade.
               </span>
+
+              {/* Status de Conexão com o Banco Supabase */}
+              <div
+                style={{
+                  marginTop: '10px',
+                  padding: '8px 12px',
+                  borderRadius: '6px',
+                  fontSize: '12px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                  background: dbHealth?.tableReady
+                    ? 'rgba(16, 185, 129, 0.12)'
+                    : dbHealth?.connected
+                    ? 'rgba(245, 158, 11, 0.12)'
+                    : 'rgba(239, 68, 68, 0.12)',
+                  border: `1px solid ${
+                    dbHealth?.tableReady
+                      ? 'rgba(16, 185, 129, 0.35)'
+                      : dbHealth?.connected
+                      ? 'rgba(245, 158, 11, 0.35)'
+                      : 'rgba(239, 68, 68, 0.35)'
+                  }`,
+                  color: dbHealth?.tableReady
+                    ? '#10b981'
+                    : dbHealth?.connected
+                    ? '#f59e0b'
+                    : '#ef4444',
+                }}
+              >
+                <Database size={14} />
+                <span>
+                  {dbHealth === null
+                    ? 'Conectando ao Supabase...'
+                    : dbHealth.tableReady
+                    ? 'Supabase: Conectado e pronto para gravação'
+                    : dbHealth.connected
+                    ? 'Supabase: Conectado (Execute a migration SQL na tabela profiles)'
+                    : dbHealth.message}
+                </span>
+              </div>
             </div>
 
             {/* Barra de Progresso Global */}

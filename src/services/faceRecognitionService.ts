@@ -1,5 +1,6 @@
 import { FaceLandmarker, FilesetResolver, type FaceLandmarkerResult } from '@mediapipe/tasks-vision';
 import * as faceapi from '@vladmandic/face-api';
+import { supabase, isSupabaseConfigured } from './supabaseClient';
 import type {
   FaceProfile,
   FaceSample,
@@ -9,6 +10,17 @@ import type {
   QualityMetrics,
   LivenessState,
 } from '../types/face';
+
+function generateUUID(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
 
 const PROFILE_STORAGE_KEY = 'faceid_access_profile_v1';
 const SETTINGS_STORAGE_KEY = 'faceid_access_settings_v1';
@@ -405,7 +417,7 @@ class FaceRecognitionService {
     };
   }
 
-  // Gerenciamento de Perfil no Armazenamento Local
+  // Gerenciamento de Perfil no Armazenamento Local e Supabase
   public getStoredProfile(): FaceProfile | null {
     try {
       const raw = localStorage.getItem(PROFILE_STORAGE_KEY);
@@ -416,8 +428,113 @@ class FaceRecognitionService {
     }
   }
 
-  public saveProfile(name: string, samples: FaceSample[]): FaceProfile {
-    // Calcular vetor médio L2-normalizado para robustez
+  /**
+   * Busca o perfil biométrico persistido no banco de dados Supabase
+   */
+  public async fetchProfileFromSupabase(): Promise<FaceProfile | null> {
+    if (!isSupabaseConfigured) return this.getStoredProfile();
+
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+
+      let query = supabase.from('profiles').select('*');
+
+      if (session?.user?.id) {
+        query = query.eq('id', session.user.id);
+      } else {
+        query = query.order('updated_at', { ascending: false }).limit(1);
+      }
+
+      const { data, error } = await query;
+
+      if (error) {
+        console.warn('[FaceID Supabase] Consulta ao banco retornou aviso/erro:', error.message);
+        return this.getStoredProfile();
+      }
+
+      if (data && data.length > 0) {
+        const row = data[0];
+        if (row.average_descriptor) {
+          const remoteProfile: FaceProfile = {
+            id: row.id,
+            name: row.full_name || 'Proprietário Autorizado',
+            role: row.role || 'System Administrator & Root Owner',
+            createdAt: row.created_at || new Date().toISOString(),
+            samples: Array.isArray(row.samples) ? row.samples : [],
+            averageDescriptor: Array.isArray(row.average_descriptor) ? row.average_descriptor : [],
+            livenessVerified: row.liveness_verified ?? true,
+          };
+          localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(remoteProfile));
+          return remoteProfile;
+        }
+      }
+
+      return null;
+    } catch (err) {
+      console.warn('[FaceID Supabase] Falha ao consultar Supabase (usando cache local):', err);
+      return this.getStoredProfile();
+    }
+  }
+
+  /**
+   * Verifica a correspondência facial com o servidor Supabase via RPC verify_face_match.
+   * Não expõe os descritores biométricos ao cliente.
+   */
+  public async verifyFaceWithServer(
+    descriptor: number[],
+    threshold: number = 0.58
+  ): Promise<{
+    matched: boolean;
+    user_id?: string;
+    full_name?: string;
+    role?: string;
+    distance?: number;
+    similarity?: number;
+    message?: string;
+  }> {
+    if (!isSupabaseConfigured) {
+      return { matched: false, message: 'Supabase não configurado' };
+    }
+
+    try {
+      const { data, error } = await supabase.rpc('verify_face_match', {
+        candidate_descriptor: descriptor,
+        threshold: threshold,
+        device_info: navigator.userAgent || 'Web Browser',
+        ip_address: 'Client Direct',
+      });
+
+      if (error) {
+        console.warn('[FaceID Supabase RPC] Erro na função verify_face_match:', error.message);
+        return { matched: false, message: error.message };
+      }
+
+      return data as {
+        matched: boolean;
+        user_id?: string;
+        full_name?: string;
+        role?: string;
+        distance?: number;
+        similarity?: number;
+        message?: string;
+      };
+    } catch (err: any) {
+      console.warn('[FaceID Supabase RPC] Falha de comunicação com RPC:', err);
+      return { matched: false, message: err?.message || 'Falha de rede' };
+    }
+  }
+
+  /**
+   * Salva o perfil biométrico sincronizando com Supabase e localStorage.
+   * Cria/vincula a conta em auth.users para respeitar as chaves estrangeiras.
+   */
+  public async saveProfile(
+    name: string,
+    samples: FaceSample[],
+    authCredentials?: { email?: string; password?: string }
+  ): Promise<FaceProfile> {
     const sampleLength = samples[0]?.descriptor.length || 128;
     const avg = new Array(sampleLength).fill(0);
 
@@ -435,10 +552,123 @@ class FaceRecognitionService {
     const norm = Math.sqrt(avg.reduce((acc, v) => acc + v * v, 0)) || 1;
     const normalizedAvg = avg.map((v) => v / norm);
 
+    let profileId = generateUUID();
+
+    // 1. Integrar com Supabase Auth para obter UUID legítimo em auth.users
+    if (isSupabaseConfigured) {
+      try {
+        let activeSession = (await supabase.auth.getSession()).data.session;
+
+        // Se o usuário informou e-mail e senha e não está logado, cadastra ou autentica
+        if (!activeSession && authCredentials?.email && authCredentials?.password) {
+          const signUpRes = await supabase.auth.signUp({
+            email: authCredentials.email,
+            password: authCredentials.password,
+            options: {
+              data: { full_name: name },
+            },
+          });
+
+          if (signUpRes.data?.user) {
+            profileId = signUpRes.data.user.id;
+          } else if (signUpRes.error?.message?.toLowerCase().includes('already registered')) {
+            // Se já registrado, tenta autenticar com a senha informada
+            const signInRes = await supabase.auth.signInWithPassword({
+              email: authCredentials.email,
+              password: authCredentials.password,
+            });
+            if (signInRes.data?.user) {
+              profileId = signInRes.data.user.id;
+            }
+          }
+        } else if (activeSession?.user?.id) {
+          profileId = activeSession.user.id;
+        }
+      } catch (authErr) {
+        console.warn('[FaceID Supabase] Processo de autenticação prévio:', authErr);
+      }
+    }
+
     const profile: FaceProfile = {
-      id: 'usr_' + Date.now().toString(36),
-      name: name.trim() || 'Proprietário Autorizado',
-      role: 'System Administrator & Root Owner',
+      id: profileId,
+      name: name.trim() || 'Usuário Cadastrado',
+      role: 'user', // Default 'user' (sem privilégios de administrador por padrão)
+      createdAt: new Date().toISOString(),
+      samples,
+      averageDescriptor: normalizedAvg,
+      livenessVerified: true,
+    };
+
+    // Cache local imediato
+    localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(profile));
+
+    // 2. Persistir no Supabase (profiles e face_registrations)
+    if (isSupabaseConfigured) {
+      console.log('[FaceID Supabase] Enviando perfil para a tabela profiles...');
+      const { error: profileError } = await supabase
+        .from('profiles')
+        .upsert(
+          {
+            id: profile.id,
+            full_name: profile.name,
+            role: profile.role,
+            average_descriptor: profile.averageDescriptor,
+            samples: profile.samples,
+            liveness_verified: profile.livenessVerified,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'id' }
+        );
+
+      if (profileError) {
+        console.error('[FaceID Supabase] Erro ao gravar perfil:', profileError);
+        throw new Error(`Falha no banco Supabase: ${profileError.message}`);
+      }
+
+      // Registrar status na tabela face_registrations
+      try {
+        await supabase.from('face_registrations').upsert(
+          {
+            user_id: profile.id,
+            status: 'active',
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'user_id' }
+        );
+      } catch (regErr) {
+        console.warn('[FaceID Supabase] Aviso ao registrar em face_registrations:', regErr);
+      }
+
+      console.log('[FaceID Supabase] Perfil e registro biométrico salvos com sucesso!');
+    }
+
+    return profile;
+  }
+
+  /**
+   * Salva o perfil apenas localmente em caso de fallback
+   */
+  public saveProfileLocally(name: string, samples: FaceSample[]): FaceProfile {
+    const sampleLength = samples[0]?.descriptor.length || 128;
+    const avg = new Array(sampleLength).fill(0);
+
+    samples.forEach((s) => {
+      s.descriptor.forEach((val, i) => {
+        avg[i] += val;
+      });
+    });
+
+    for (let i = 0; i < sampleLength; i++) {
+      avg[i] /= samples.length;
+    }
+
+    const norm = Math.sqrt(avg.reduce((acc, v) => acc + v * v, 0)) || 1;
+    const normalizedAvg = avg.map((v) => v / norm);
+
+    const profile: FaceProfile = {
+      id: generateUUID(),
+      name: name.trim() || 'Usuário Cadastrado',
+      role: 'user',
       createdAt: new Date().toISOString(),
       samples,
       averageDescriptor: normalizedAvg,
@@ -449,7 +679,22 @@ class FaceRecognitionService {
     return profile;
   }
 
-  public deleteProfile(): void {
+  public async deleteProfile(): Promise<void> {
+    const current = this.getStoredProfile();
+    if (current?.id && isSupabaseConfigured) {
+      try {
+        await supabase.from('face_registrations').delete().eq('user_id', current.id);
+        const { error } = await supabase.from('profiles').delete().eq('id', current.id);
+        if (error) {
+          console.warn('[FaceID Supabase] Erro ao deletar do Supabase:', error.message);
+        } else {
+          console.log('[FaceID Supabase] Perfil removido do Supabase com sucesso.');
+        }
+      } catch (err) {
+        console.warn('[FaceID Supabase] Exceção ao deletar perfil do banco:', err);
+      }
+    }
+
     localStorage.removeItem(PROFILE_STORAGE_KEY);
     this.resetConsecutiveMatches();
   }
@@ -465,7 +710,7 @@ class FaceRecognitionService {
     }
   }
 
-  public addAuditLog(entry: Omit<SecurityAuditEntry, 'id' | 'timestamp'>): void {
+  public async addAuditLog(entry: Omit<SecurityAuditEntry, 'id' | 'timestamp'>): Promise<void> {
     const logs = this.getAuditLogs();
     const newEntry: SecurityAuditEntry = {
       ...entry,
@@ -475,10 +720,110 @@ class FaceRecognitionService {
     logs.unshift(newEntry);
     if (logs.length > 50) logs.pop(); // Manter últimos 50 eventos
     localStorage.setItem(AUDIT_STORAGE_KEY, JSON.stringify(logs));
+
+    if (isSupabaseConfigured) {
+      try {
+        await supabase.from('security_audit_logs').insert([
+          {
+            status: entry.status,
+            user_name: entry.userName,
+            similarity: entry.similarity,
+            distance: entry.distance,
+            liveness_score: entry.livenessScore,
+            ip_mock: entry.ipMock,
+            device_info: entry.deviceInfo,
+            timestamp: newEntry.timestamp,
+          },
+        ]);
+      } catch {
+        // Tabela de auditoria opcional
+      }
+    }
   }
 
-  public clearAuditLogs(): void {
+  public async clearAuditLogs(): Promise<void> {
     localStorage.removeItem(AUDIT_STORAGE_KEY);
+    if (isSupabaseConfigured) {
+      try {
+        await supabase
+          .from('security_audit_logs')
+          .delete()
+          .neq('id', '00000000-0000-0000-0000-000000000000');
+      } catch {
+        // Silencioso se tabela não existir
+      }
+    }
+  }
+
+  /**
+   * Diagnóstico do status de conexão com o Supabase
+   */
+  public async checkSupabaseHealth(): Promise<{
+    configured: boolean;
+    connected: boolean;
+    tableReady: boolean;
+    message: string;
+    details?: string;
+  }> {
+    if (!isSupabaseConfigured) {
+      return {
+        configured: false,
+        connected: false,
+        tableReady: false,
+        message: 'Variáveis VITE_SUPABASE_URL ou VITE_SUPABASE_PUBLISHABLE_KEY não configuradas.',
+      };
+    }
+
+    try {
+      const { error } = await supabase
+        .from('profiles')
+        .select('id, full_name, average_descriptor')
+        .limit(1);
+
+      if (!error) {
+        return {
+          configured: true,
+          connected: true,
+          tableReady: true,
+          message: 'Conectado ao Supabase com tabela profiles pronta para biometria.',
+        };
+      }
+
+      if (error.code === '42703') {
+        return {
+          configured: true,
+          connected: true,
+          tableReady: false,
+          message: 'Tabela profiles existe, mas faltam as colunas biométricas (execute a migration SQL).',
+          details: error.message,
+        };
+      }
+
+      if (error.code === '42501') {
+        return {
+          configured: true,
+          connected: true,
+          tableReady: false,
+          message: 'Conectado ao Supabase, mas a política de RLS bloqueou o acesso.',
+          details: error.message,
+        };
+      }
+
+      return {
+        configured: true,
+        connected: false,
+        tableReady: false,
+        message: `Aviso do Supabase: ${error.message}`,
+        details: error.details,
+      };
+    } catch (err: any) {
+      return {
+        configured: true,
+        connected: false,
+        tableReady: false,
+        message: `Falha de rede ao conectar com Supabase: ${err?.message || err}`,
+      };
+    }
   }
 
   // Configurações Biométricas

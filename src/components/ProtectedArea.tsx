@@ -70,13 +70,13 @@ export const ProtectedArea: React.FC<ProtectedAreaProps> = ({
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
-  const handleClearLogs = () => {
-    faceService.clearAuditLogs();
+  const handleClearLogs = async () => {
+    await faceService.clearAuditLogs();
     setAuditLogs([]);
   };
 
-  const handleDeleteProfile = () => {
-    faceService.deleteProfile();
+  const handleDeleteProfile = async () => {
+    await faceService.deleteProfile();
     audioFeedback.playAccessDenied();
     onProfileDeleted();
   };

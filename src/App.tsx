@@ -22,13 +22,28 @@ export function App() {
   const [settings, setSettings] = useState<BiometricSettings>(DEFAULT_SETTINGS);
   const [session, setSession] = useState<AuthenticatedSession | null>(null);
 
-  // Carregar dados salvos na inicialização
+  // Carregar dados salvos na inicialização e sincronizar com Supabase
   useEffect(() => {
+    // 1. Carrega imediatamente o cache local para velocidade instantânea
     const savedProfile = faceService.getStoredProfile();
     const savedSettings = faceService.getSettings();
-    setProfile(savedProfile);
+    if (savedProfile) {
+      setProfile(savedProfile);
+    }
     setSettings(savedSettings);
     audioFeedback.setMuted(!savedSettings.soundEffects);
+
+    // 2. Sincroniza em segundo plano com o banco de dados Supabase
+    faceService
+      .fetchProfileFromSupabase()
+      .then((remoteProfile) => {
+        if (remoteProfile) {
+          setProfile(remoteProfile);
+        }
+      })
+      .catch((err) => {
+        console.warn('[App] Sincronização inicial com Supabase:', err);
+      });
   }, []);
 
   const handleUpdateSettings = (newSettings: BiometricSettings) => {
@@ -52,7 +67,8 @@ export function App() {
     setCurrentScreen('login');
   };
 
-  const handleProfileDeleted = () => {
+  const handleProfileDeleted = async () => {
+    await faceService.deleteProfile();
     setProfile(null);
     setSession(null);
     setCurrentScreen('login');
